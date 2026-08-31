@@ -12,7 +12,7 @@ from livekit.agents import (
     inference,
     room_io,
 )
-from livekit.plugins import ai_coustics
+from livekit.plugins import ai_coustics, bey
 
 logger = logging.getLogger("agent")
 
@@ -124,6 +124,17 @@ async def my_agent(ctx: JobContext):
         expressive=True,
     )
 
+    # Add a virtual avatar to the session (Beyond Presence).
+    # avatar_id comes from your Beyond Presence dashboard (https://app.bey.dev) —
+    # replace the placeholder below with your real avatar's ID.
+    # See https://docs.livekit.io/agents/models/avatar/plugins/bey/
+    avatar = bey.AvatarSession(
+        avatar_id="7124071d-480e-4fdc-ad0e-a2e0680f1378",
+    )
+    # Per Beyond Presence's docs, start the avatar and wait for it to join
+    # BEFORE starting the agent session.
+    await avatar.start(session, room=ctx.room)
+
     # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
         agent=Assistant(),
@@ -136,17 +147,6 @@ async def my_agent(ctx: JobContext):
             ),
         ),
     )
-
-    # # Add a virtual avatar to the session, if desired
-    # # For other providers, see https://docs.livekit.io/agents/models/avatar/
-    # avatar = anam.AvatarSession(
-    #     persona_config=anam.PersonaConfig(
-    #         name="...",
-    #         avatarId="...",  # See https://docs.livekit.io/agents/models/avatar/plugins/anam
-    #     ),
-    # )
-    # # Start the avatar and wait for it to join
-    # await avatar.start(session, room=ctx.room)
 
     # Join the room and connect to the user
     await ctx.connect()

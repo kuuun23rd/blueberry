@@ -1,11 +1,12 @@
 'use client';
 
+import { useEffect, useRef } from 'react';
 import { useTheme } from 'next-themes';
 import { AnimatePresence, motion } from 'motion/react';
-import { useSessionContext } from '@livekit/components-react';
+import { useChat, useRoomContext, useSessionContext } from '@livekit/components-react';
 import type { AppConfig } from '@/app-config';
 import { AgentSessionView_01 } from '@/components/agents-ui/blocks/agent-session-view-01';
-import { WelcomeView } from '@/components/app/welcome-view';
+import { type InterviewSetup, WelcomeView } from '@/components/app/welcome-view';
 
 const MotionWelcomeView = motion.create(WelcomeView);
 const MotionSessionView = motion.create(AgentSessionView_01);
@@ -35,6 +36,51 @@ interface ViewControllerProps {
 export function ViewController({ appConfig }: ViewControllerProps) {
   const { isConnected, start } = useSessionContext();
   const { resolvedTheme } = useTheme();
+  const room = useRoomContext();
+  const { send } = useChat();
+
+  // Filled in when the candidate submits the setup form, then flushed once the room
+  // connection is up (see the effect below) -- the resume/job title can't be sent to the
+  // agent until the participant is actually connected.
+  const pendingSetupRef = useRef<InterviewSetup | null>(null);
+  const setupSentRef = useRef(false);
+
+  const handleStartCall = (setup: InterviewSetup) => {
+    pendingSetupRef.current = setup;
+    setupSentRef.current = false;
+    start();
+  };
+
+  useEffect(() => {
+    if (!isConnected || setupSentRef.current) return;
+    const setup = pendingSetupRef.current;
+    if (!setup) return;
+    setupSentRef.current = true;
+
+    void (async () => {
+      // Send the resume first and await full delivery before the job title message --
+      // the agent uses whichever resume text has already arrived by the time it processes
+      // the job title, so sending resume-before-title gives it the best chance of being
+      // ready in time (see backend/my-agent/src/agent.py's _choose_question_bank).
+      if (setup.resumeFile) {
+        try {
+          await room.localParticipant.sendFile(setup.resumeFile, {
+            topic: 'resume',
+            mimeType: 'application/pdf',
+          });
+        } catch (error) {
+          console.error('Failed to send resume to the interview agent', error);
+        }
+      }
+      if (setup.jobTitle) {
+        try {
+          await send(`I'd like to practice for a ${setup.jobTitle} role.`);
+        } catch (error) {
+          console.error('Failed to send job title to the interview agent', error);
+        }
+      }
+    })();
+  }, [isConnected, room, send]);
 
   return (
     <AnimatePresence mode="wait">
@@ -44,7 +90,7 @@ export function ViewController({ appConfig }: ViewControllerProps) {
           key="welcome"
           {...VIEW_MOTION_PROPS}
           startButtonText={appConfig.startButtonText}
-          onStartCall={start}
+          onStartCall={handleStartCall}
         />
       )}
       {/* Session view */}

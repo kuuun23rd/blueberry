@@ -1,3 +1,6 @@
+'use client';
+
+import { useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 
 function WelcomeImage() {
@@ -18,9 +21,14 @@ function WelcomeImage() {
   );
 }
 
+export interface InterviewSetup {
+  jobTitle: string;
+  resumeFile: File | null;
+}
+
 interface WelcomeViewProps {
   startButtonText: string;
-  onStartCall: () => void;
+  onStartCall: (setup: InterviewSetup) => void;
 }
 
 export const WelcomeView = ({
@@ -28,6 +36,26 @@ export const WelcomeView = ({
   onStartCall,
   ref,
 }: React.ComponentProps<'div'> & WelcomeViewProps) => {
+  const [jobTitle, setJobTitle] = useState('');
+  const [resumeFile, setResumeFile] = useState<File | null>(null);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const acceptFile = (file: File | null) => {
+    if (!file) return;
+    if (file.type !== 'application/pdf') {
+      setFileError('Please choose a PDF file.');
+      return;
+    }
+    setFileError(null);
+    setResumeFile(file);
+  };
+
+  const handleSubmit = (event: React.FormEvent) => {
+    event.preventDefault();
+    onStartCall({ jobTitle: jobTitle.trim(), resumeFile });
+  };
+
   return (
     <div ref={ref}>
       <section className="bg-background flex flex-col items-center justify-center text-center">
@@ -36,14 +64,49 @@ export const WelcomeView = ({
         <p className="text-foreground max-w-prose pt-1 leading-6 font-medium">
           Chat live with your voice AI agent
         </p>
+        <p className="text-muted-foreground max-w-prose pt-1 text-xs leading-5 text-pretty">
+          Optionally upload your resume and target role so the interview questions are tailored to
+          you.
+        </p>
 
-        <Button
-          size="lg"
-          onClick={onStartCall}
-          className="mt-6 w-64 rounded-full font-mono text-xs font-bold tracking-wider uppercase"
-        >
-          {startButtonText}
-        </Button>
+        <form onSubmit={handleSubmit} className="mt-6 flex w-72 flex-col gap-3">
+          <input
+            type="text"
+            value={jobTitle}
+            onChange={(event) => setJobTitle(event.target.value)}
+            placeholder="Target job title (optional)"
+            className="border-input bg-background text-foreground placeholder:text-muted-foreground rounded-md border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-offset-2"
+          />
+
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            onDragOver={(event) => event.preventDefault()}
+            onDrop={(event) => {
+              event.preventDefault();
+              acceptFile(event.dataTransfer.files?.[0] ?? null);
+            }}
+            className="border-input text-muted-foreground hover:border-foreground/40 cursor-pointer rounded-md border border-dashed px-3 py-4 text-xs transition-colors"
+          >
+            {resumeFile ? resumeFile.name : 'Drop your resume (PDF) here, or click to choose'}
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/pdf"
+            onChange={(event) => acceptFile(event.target.files?.[0] ?? null)}
+            className="hidden"
+          />
+          {fileError && <p className="text-destructive text-xs">{fileError}</p>}
+
+          <Button
+            type="submit"
+            size="lg"
+            className="mt-2 w-full rounded-full font-mono text-xs font-bold tracking-wider uppercase"
+          >
+            {startButtonText}
+          </Button>
+        </form>
       </section>
 
       <div className="fixed bottom-5 left-0 flex w-full items-center justify-center">

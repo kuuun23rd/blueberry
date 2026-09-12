@@ -1,4 +1,6 @@
-from interview_flow import parse_followup_decision
+import pytest
+
+from interview_flow import parse_feedback_list, parse_followup_decision
 
 
 def test_parses_follow_up_with_question() -> None:
@@ -32,3 +34,36 @@ def test_falls_back_to_move_on_for_unrecognized_text() -> None:
     )
     assert decision.action == "move_on"
     assert decision.next_question is None
+
+
+def test_parses_feedback_json_array() -> None:
+    feedback = parse_feedback_list(
+        '["Good use of a concrete example.", "Try quantifying the impact next time."]',
+        expected_count=2,
+    )
+    assert feedback == [
+        "Good use of a concrete example.",
+        "Try quantifying the impact next time.",
+    ]
+
+
+def test_parses_feedback_strips_code_fence() -> None:
+    feedback = parse_feedback_list(
+        '```json\n["Solid, specific answer."]\n```', expected_count=1
+    )
+    assert feedback == ["Solid, specific answer."]
+
+
+def test_feedback_raises_on_wrong_count() -> None:
+    with pytest.raises(ValueError):
+        parse_feedback_list('["Only one entry."]', expected_count=2)
+
+
+def test_feedback_raises_on_invalid_json() -> None:
+    with pytest.raises(ValueError):
+        parse_feedback_list("not json at all", expected_count=1)
+
+
+def test_feedback_raises_on_non_string_entries() -> None:
+    with pytest.raises(ValueError):
+        parse_feedback_list("[1, 2]", expected_count=2)

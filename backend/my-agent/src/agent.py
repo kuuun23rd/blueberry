@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import textwrap
 
@@ -24,7 +25,9 @@ from interview_flow import (
     AskQuestionTask,
     InterviewState,
     QuestionAnswer,
+    TranscriptEntry,
     evaluate_answer,
+    generate_transcript_feedback,
 )
 from resume_parser import ResumeParseError, extract_resume_text, generate_question_bank
 
@@ -41,7 +44,11 @@ class InterviewerAgent(Agent):
     this agent's own instructions stay small and focused on the intake step.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, room: rtc.Room | None = None) -> None:
+        # Used to publish small progress/status data messages to the frontend (see
+        # _publish_data below) -- e.g. "question 3 of 8", "interview complete". Optional
+        # so tests can construct this agent without a real room.
+        self._room = room
         super().__init__(
             # This agent doesn't set its own llm -- it's configured on the AgentSession
             # instead (see my_agent() below), so that AskQuestionTask instances, which
@@ -63,8 +70,17 @@ class InterviewerAgent(Agent):
 
                 # Your job right now
 
-                Briefly welcome the candidate and ask what role or job title they'd like to practice
-                for. Once they tell you, call `set_target_role` with it -- that starts the interview.
+                Check whether the candidate has already told you what role or job title they want to
+                practice for -- for example, an earlier message like "I'd like to practice for a Full
+                Stack Developer role." (They may have typed this into a setup form before the call
+                even started, so it can be the very first thing you see.) If so, do not ask again:
+                briefly and warmly welcome them, confirm the role in one short sentence, and call
+                `set_target_role` with it right away so the interview can begin.
+
+                Otherwise, briefly welcome the candidate and ask what role or job title they'd like to
+                practice for. Once they tell you, call `set_target_role` with it -- that starts the
+                interview.
+
                 Do not ask interview questions yourself; the rest of the interview is handled elsewhere.
 
                 NOTE: if the candidate uploaded a resume before the call, the interview questions
@@ -102,10 +118,7 @@ class InterviewerAgent(Agent):
 
         while state.questions_asked < state.max_questions and state.remaining_questions:
             question = state.remaining_questions.pop(0)
-            qa: QuestionAnswer = await AskQuestionTask(
-                question=question, chat_ctx=self.chat_ctx
-            )
-            state.questions_asked += 1
+            qa = await self._ask_and_record(question, state)
 
             while state.questions_asked < state.max_questions:
                 decision = await evaluate_answer(
@@ -113,14 +126,91 @@ class InterviewerAgent(Agent):
                 )
                 if decision.action != "follow_up" or not decision.next_question:
                     break
-                qa = await AskQuestionTask(
-                    question=decision.next_question, chat_ctx=self.chat_ctx
-                )
-                state.questions_asked += 1
+                qa = await self._ask_and_record(decision.next_question, state)
 
         self.session.generate_reply(
             instructions="Thank the candidate warmly for their time and wrap up the interview."
         )
+        await self._generate_and_publish_summary(llm_v, state)
+
+    async def _ask_and_record(
+        self, question: str, state: InterviewState
+    ) -> QuestionAnswer:
+        """Run one AskQuestionTask, then record what the interviewer actually said alongside
+        the candidate's answer.
+
+        AskQuestionTask is instructed to ask in its own natural phrasing rather than quoting
+        `question` verbatim, so the literal spoken text (captured via the
+        "conversation_item_added" listener registered in my_agent(), which appends every
+        assistant utterance to state.assistant_lines) can differ from it. We record whatever
+        was actually said, falling back to the canonical `question` text only if nothing was
+        captured (e.g. an unexpected event-ordering edge case).
+        """
+        spoken_before = len(state.assistant_lines)
+        qa: QuestionAnswer = await AskQuestionTask(question=question, chat_ctx=self.chat_ctx)
+        state.questions_asked += 1
+        spoken = " ".join(state.assistant_lines[spoken_before:]).strip() or question
+        state.transcript.append(
+            TranscriptEntry(question=spoken, answer_summary=qa.answer_summary)
+        )
+        await self._publish_progress(state)
+        return qa
+
+    async def _generate_and_publish_summary(
+        self, llm_v: llm.LLM, state: InterviewState
+    ) -> None:
+        """Generate per-question feedback for the whole transcript, then send it to the
+        frontend alongside the "interview complete" signal so the Summary screen can show the
+        full Q&A plus feedback, not just a stats count.
+
+        A single extra (non-voice) LLM call over the whole transcript, made once at the end --
+        not per-question -- so it doesn't add a round-trip after every answer. If it fails to
+        parse, we still send the transcript, just without feedback text, rather than blocking
+        the candidate on this.
+        """
+        try:
+            feedback_list = await generate_transcript_feedback(llm_v, state.transcript)
+            for entry, feedback in zip(state.transcript, feedback_list, strict=True):
+                entry.feedback = feedback
+        except ValueError:
+            logger.exception(
+                "Could not generate transcript feedback; sending transcript without it"
+            )
+
+        await self._publish_data(
+            "interview-complete",
+            {
+                "transcript": [
+                    {
+                        "question": entry.question,
+                        "answer": entry.answer_summary,
+                        "feedback": entry.feedback,
+                    }
+                    for entry in state.transcript
+                ]
+            },
+        )
+
+    async def _publish_progress(self, state: InterviewState) -> None:
+        await self._publish_data(
+            "interview-progress",
+            {"questionsAsked": state.questions_asked, "maxQuestions": state.max_questions},
+        )
+
+    async def _publish_data(self, topic: str, data: dict) -> None:
+        """Best-effort status update to the frontend over a LiveKit data message.
+
+        Never raises -- a failed publish (e.g. no room in a test context, or a transient
+        send error) should not interrupt the interview itself.
+        """
+        if self._room is None:
+            return
+        try:
+            await self._room.local_participant.publish_data(
+                json.dumps(data).encode("utf-8"), reliable=True, topic=topic
+            )
+        except Exception:
+            logger.exception("Failed to publish %r data message", topic)
 
     async def _choose_question_bank(
         self, llm_v: llm.LLM, state: InterviewState
@@ -239,6 +329,15 @@ async def my_agent(ctx: JobContext):
         expressive=True,
     )
 
+    # Records every line the agent actually speaks (see InterviewState.assistant_lines), so
+    # the transcript sent to the frontend at the end reflects what the interviewer literally
+    # said, not just the internal canonical question text it was given.
+    def _on_conversation_item_added(event) -> None:
+        if event.item.role == "assistant" and event.item.text_content:
+            state.assistant_lines.append(event.item.text_content)
+
+    session.on("conversation_item_added", _on_conversation_item_added)
+
     # Add a virtual avatar to the session (Beyond Presence).
     # avatar_id comes from your Beyond Presence dashboard (https://app.bey.dev) —
     # replace the placeholder below with your real avatar's ID.
@@ -247,12 +346,21 @@ async def my_agent(ctx: JobContext):
         avatar_id="7124071d-480e-4fdc-ad0e-a2e0680f1378",
     )
     # Per Beyond Presence's docs, start the avatar and wait for it to join
-    # BEFORE starting the agent session.
-    await avatar.start(session, room=ctx.room)
+    # BEFORE starting the agent session. If the avatar fails to join (Beyond Presence
+    # outage, bad avatar_id, quota, etc.), don't crash the whole job -- fall back to a
+    # voice-only interview instead. The frontend already handles this: tile-view.tsx only
+    # renders the avatar tile when an avatar video track actually exists, showing the
+    # audio-visualizer fallback otherwise.
+    try:
+        await avatar.start(session, room=ctx.room)
+    except Exception:
+        logger.exception(
+            "Beyond Presence avatar failed to join; continuing in voice-only mode"
+        )
 
     # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
-        agent=InterviewerAgent(),
+        agent=InterviewerAgent(room=ctx.room),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(

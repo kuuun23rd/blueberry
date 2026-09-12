@@ -17,6 +17,7 @@ parsing + question generation work.
 
 from __future__ import annotations
 
+import json
 import re
 import textwrap
 from dataclasses import dataclass, field
@@ -42,6 +43,21 @@ GENERIC_QUESTIONS: list[str] = [
 
 
 @dataclass
+class TranscriptEntry:
+    """One asked question + the candidate's answer, plus feedback filled in afterward.
+
+    `feedback` starts as None and is populated in bulk, after the whole interview finishes, by
+    `generate_transcript_feedback` -- generating feedback per-question as we go would add an
+    extra non-voice LLM call (and a little latency) after every single answer, so we do it once
+    at the end instead.
+    """
+
+    question: str
+    answer_summary: str
+    feedback: str | None = None
+
+
+@dataclass
 class InterviewState:
     target_role: str | None = None
     remaining_questions: list[str] = field(default_factory=list)
@@ -52,6 +68,17 @@ class InterviewState:
     # no synchronization with the upload, so a resume that arrives late is simply missed in favor
     # of GENERIC_QUESTIONS rather than adding latency to wait for it.
     resume_text: str | None = None
+    # Every question asked and how the candidate answered it, in order, across the whole
+    # interview (including follow-ups). Sent to the frontend at the end (see agent.py) so the
+    # candidate can review their full Q&A and per-question feedback on the Summary screen.
+    transcript: list[TranscriptEntry] = field(default_factory=list)
+    # Every line the agent actually spoke (assistant-role conversation items), in order, for
+    # the whole session -- populated by a "conversation_item_added" listener registered in
+    # agent.py's my_agent(). AskQuestionTask is instructed to ask each question "in your own
+    # natural phrasing" rather than quoting it verbatim, so this is how we record what the
+    # interviewer literally said, as opposed to the internal canonical question text it was
+    # given. Used by _ask_and_record (agent.py) to fill in each TranscriptEntry.question.
+    assistant_lines: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -159,3 +186,91 @@ async def evaluate_answer(
     )
     response = await llm_v.chat(chat_ctx=chat_ctx).collect()
     return parse_followup_decision(response.text)
+
+
+def _strip_code_fence(text: str) -> str:
+    """Strip a ```...``` or ```json...``` wrapper some models add despite instructions not to.
+
+    Mirrors the identically-named helper in resume_parser.py -- kept as a separate copy rather
+    than a shared import so the two modules stay independent and independently testable.
+    """
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    stripped = stripped.removeprefix("```json").removeprefix("```")
+    return stripped.removesuffix("```").strip()
+
+
+_FEEDBACK_INSTRUCTIONS = """\
+You are an experienced interview coach reviewing a candidate's mock interview transcript. You \
+are not talking to the candidate directly -- your output is read by another system, not spoken \
+aloud or shown as a transcript of speech.
+
+For each numbered question-and-answer pair below, write one short piece of constructive \
+feedback (1 to 2 sentences): what the candidate did well, and one concrete thing they could \
+improve, if anything. If an answer was already strong and complete, say so briefly rather than \
+inventing a criticism.
+
+Respond with ONLY a JSON array of strings, exactly one entry per numbered pair below, in the \
+same order, and nothing else.
+
+Transcript:
+{transcript_block}
+"""
+
+
+def _format_transcript(transcript: list[TranscriptEntry]) -> str:
+    return "\n\n".join(
+        f"{i + 1}. Q: {entry.question}\n   A: {entry.answer_summary}"
+        for i, entry in enumerate(transcript)
+    )
+
+
+def parse_feedback_list(text: str, *, expected_count: int) -> list[str]:
+    """Parse the feedback generator's JSON array response.
+
+    Raises:
+        ValueError: if the response isn't a JSON array of exactly `expected_count` non-empty
+            strings.
+    """
+    try:
+        data = json.loads(_strip_code_fence(text))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Feedback generator did not return valid JSON: {e}") from e
+
+    if (
+        not isinstance(data, list)
+        or len(data) != expected_count
+        or not all(isinstance(f, str) and f.strip() for f in data)
+    ):
+        raise ValueError(
+            "Feedback generator did not return the expected list of feedback strings"
+        )
+
+    return [f.strip() for f in data]
+
+
+async def generate_transcript_feedback(
+    llm_v: llm.LLM, transcript: list[TranscriptEntry]
+) -> list[str]:
+    """Generate one short feedback note per transcript entry, in the same order.
+
+    This is a single plain (non-voice) LLM call over the whole transcript, made once after the
+    interview wraps up -- not per-question -- to avoid adding an extra round-trip after every
+    single answer.
+
+    Raises:
+        ValueError: if the response can't be parsed (see `parse_feedback_list`) -- callers
+            should treat this as "no feedback available" rather than blocking on it.
+    """
+    if not transcript:
+        return []
+    chat_ctx = llm.ChatContext.empty()
+    chat_ctx.add_message(
+        role="system",
+        content=_FEEDBACK_INSTRUCTIONS.format(
+            transcript_block=_format_transcript(transcript)
+        ),
+    )
+    response = await llm_v.chat(chat_ctx=chat_ctx).collect()
+    return parse_feedback_list(response.text, expected_count=len(transcript))

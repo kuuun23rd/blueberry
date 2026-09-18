@@ -29,11 +29,32 @@ from interview_flow import (
     evaluate_answer,
     generate_transcript_feedback,
 )
-from resume_parser import ResumeParseError, extract_resume_text, generate_question_bank
+from resume_parser import (
+    ResumeParseError,
+    extract_resume_text,
+    generate_question_bank,
+    generate_role_questions,
+)
 
 logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
+
+
+async def publish_room_data(room: rtc.Room | None, topic: str, data: dict) -> None:
+    """Best-effort status update to the frontend over a LiveKit data message.
+
+    Never raises -- a failed publish (e.g. no room in a test context, or a transient
+    send error) should not interrupt the interview itself.
+    """
+    if room is None:
+        return
+    try:
+        await room.local_participant.publish_data(
+            json.dumps(data).encode("utf-8"), reliable=True, topic=topic
+        )
+    except Exception:
+        logger.exception("Failed to publish %r data message", topic)
 
 
 class InterviewerAgent(Agent):
@@ -94,6 +115,20 @@ class InterviewerAgent(Agent):
             ),
         )
 
+    async def on_enter(self) -> None:
+        # Speak first rather than waiting for the candidate -- see the module-level
+        # instructions above for the actual greet-vs-confirm-role logic; this just
+        # triggers that logic as soon as the agent becomes active. Not awaited, matching
+        # AskQuestionTask.on_enter's convention (interview_flow.py) of firing the reply
+        # without blocking session startup on it.
+        self.session.generate_reply(
+            instructions=(
+                "Start the interview now: greet the candidate, then follow the "
+                "instructions above to either confirm their already-stated target role "
+                "or ask what role they'd like to practice for."
+            )
+        )
+
     @function_tool
     async def set_target_role(
         self, context: RunContext[InterviewState], role: str
@@ -150,10 +185,17 @@ class InterviewerAgent(Agent):
         qa: QuestionAnswer = await AskQuestionTask(question=question, chat_ctx=self.chat_ctx)
         state.questions_asked += 1
         spoken = " ".join(state.assistant_lines[spoken_before:]).strip() or question
-        state.transcript.append(
-            TranscriptEntry(question=spoken, answer_summary=qa.answer_summary)
-        )
+        entry = TranscriptEntry(question=spoken, answer_summary=qa.answer_summary)
+        state.transcript.append(entry)
         await self._publish_progress(state)
+        # Published as each question is answered, not just in the final "interview-complete"
+        # summary -- so a candidate who disconnects mid-interview still has their Q&A on
+        # record (see the frontend's disconnect safety net in view-controller.tsx), just
+        # without the per-question feedback that "interview-complete" adds at the end.
+        await self._publish_data(
+            "interview-transcript-entry",
+            {"question": entry.question, "answer": entry.answer_summary},
+        )
         return qa
 
     async def _generate_and_publish_summary(
@@ -198,41 +240,28 @@ class InterviewerAgent(Agent):
         )
 
     async def _publish_data(self, topic: str, data: dict) -> None:
-        """Best-effort status update to the frontend over a LiveKit data message.
-
-        Never raises -- a failed publish (e.g. no room in a test context, or a transient
-        send error) should not interrupt the interview itself.
-        """
-        if self._room is None:
-            return
-        try:
-            await self._room.local_participant.publish_data(
-                json.dumps(data).encode("utf-8"), reliable=True, topic=topic
-            )
-        except Exception:
-            logger.exception("Failed to publish %r data message", topic)
+        await publish_room_data(self._room, topic, data)
 
     async def _choose_question_bank(
         self, llm_v: llm.LLM, state: InterviewState
     ) -> list[str]:
-        """Pick the question bank: CV-grounded if a resume was uploaded and parsed, else generic.
+        """Pick the question bank: CV-grounded if a resume was uploaded and parsed, else a
+        role-aware generic bank -- falling back to the static GENERIC_QUESTIONS only if that
+        generation itself fails.
 
         No synchronization with the resume byte-stream handler (see my_agent() below): if the
         upload hasn't arrived yet by the time this runs, we don't wait for it -- falling back to
-        GENERIC_QUESTIONS keeps interview start latency independent of upload timing.
+        the no-resume path keeps interview start latency independent of upload timing.
         """
-        if not state.resume_text:
-            return list(GENERIC_QUESTIONS)
-
         assert state.target_role is not None
         try:
-            return await generate_question_bank(
-                llm_v, resume_text=state.resume_text, target_role=state.target_role
-            )
+            if state.resume_text:
+                return await generate_question_bank(
+                    llm_v, resume_text=state.resume_text, target_role=state.target_role
+                )
+            return await generate_role_questions(llm_v, target_role=state.target_role)
         except ValueError:
-            logger.exception(
-                "CV-grounded question generation failed, using generic questions"
-            )
+            logger.exception("Question generation failed, using generic questions")
             return list(GENERIC_QUESTIONS)
 
 
@@ -267,9 +296,13 @@ async def my_agent(ctx: JobContext):
                 len(state.resume_text),
                 participant_identity,
             )
-        except ResumeParseError:
+            await publish_room_data(ctx.room, "resume-status", {"status": "success"})
+        except ResumeParseError as e:
             logger.exception(
                 "Could not parse uploaded resume from %s", participant_identity
+            )
+            await publish_room_data(
+                ctx.room, "resume-status", {"status": "error", "message": str(e)}
             )
 
     def _handle_resume_upload(
@@ -305,8 +338,13 @@ async def my_agent(ctx: JobContext):
         stt=inference.STT(model="assemblyai/universal-3-5-pro", language="en"),
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
+        # "Adrian" -- a steady, professional middle-aged male voice from Fish Audio's
+        # curated default set (docs.livekit.io/agents/models/tts/fishaudio), picked to
+        # match the Beyond Presence avatar below, which Beyond Presence's own dashboard
+        # names "Michael" (see avatar_id). Previous voice ("fa4c9eb3...") was reported as
+        # not matching the avatar's look/age.
         tts=inference.TTS(
-            model="fishaudio/s2.1-pro", voice="fa4c9eb3dccc4806b382b40d61c6b10a"
+            model="fishaudio/s2.1-pro", voice="bf322df2096a46f18c579d0baa36f41d"
         ),
         turn_handling=TurnHandlingOptions(
             # The LiveKit turn detector determines when the user is done speaking and the agent should respond.

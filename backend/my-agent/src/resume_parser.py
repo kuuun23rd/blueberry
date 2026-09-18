@@ -114,3 +114,41 @@ async def generate_question_bank(
     )
     response = await llm_v.chat(chat_ctx=chat_ctx).collect()
     return parse_question_bank(response.text)
+
+
+_ROLE_QUESTION_GEN_INSTRUCTIONS = """\
+You are preparing a mock interview for a candidate targeting this role: {target_role}
+
+No resume was provided, so generate a general-purpose question set that still fits this \
+specific role, mixing:
+- Behavioral questions relevant to the role
+- Questions about the skills and day-to-day work the role actually involves -- ask about \
+technical problem-solving ONLY if the role is a technical one (e.g. software engineering, \
+data, IT); for non-technical roles (e.g. sales, marketing, HR, operations, design, \
+management, finance), ask about the non-technical skills and scenarios that role actually \
+requires instead
+- Role-specific situational questions
+
+Generate 6 to 8 questions total.
+
+Respond with ONLY a JSON array of strings, one per question, and nothing else. Do not include
+numbering, markdown, or commentary -- just the JSON array.
+"""
+
+
+async def generate_role_questions(llm_v: llm.LLM, *, target_role: str) -> list[str]:
+    """Generate a role-aware question bank when no resume was uploaded to ground one in.
+
+    Raises:
+        ValueError: if the LLM's response can't be parsed as a question list
+            (see `parse_question_bank`) -- callers should fall back to
+            GENERIC_QUESTIONS in that case rather than starting an interview
+            with no questions.
+    """
+    chat_ctx = llm.ChatContext.empty()
+    chat_ctx.add_message(
+        role="system",
+        content=_ROLE_QUESTION_GEN_INSTRUCTIONS.format(target_role=target_role),
+    )
+    response = await llm_v.chat(chat_ctx=chat_ctx).collect()
+    return parse_question_bank(response.text)

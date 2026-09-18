@@ -89,7 +89,15 @@ export function ViewController({ appConfig }: ViewControllerProps) {
   const pendingSetupRef = useRef<InterviewSetup | null>(null);
   const setupSentRef = useRef(false);
 
-  const buildSummary = (transcript: TranscriptEntry[] = []): InterviewSummary => ({
+  // Filled in incrementally as each question is answered (see the "interview-transcript-entry"
+  // listener below), so the interview's actual Q&A survives an early disconnect -- the full,
+  // feedback-annotated transcript from "interview-complete" below still takes priority when the
+  // interview finishes normally.
+  const transcriptRef = useRef<TranscriptEntry[]>([]);
+
+  const buildSummary = (
+    transcript: TranscriptEntry[] = transcriptRef.current
+  ): InterviewSummary => ({
     jobTitle: pendingSetupRef.current?.jobTitle ?? '',
     durationSeconds: sessionStartRef.current
       ? Math.round((Date.now() - sessionStartRef.current) / 1000)
@@ -114,8 +122,46 @@ export function ViewController({ appConfig }: ViewControllerProps) {
     }
   });
 
+  // Lets the candidate know whether their uploaded resume actually got parsed (see
+  // backend/my-agent/src/agent.py's _process_resume_upload, which publishes this once it
+  // finishes trying) -- previously this failed silently, so a bad PDF (e.g. a scanned
+  // image with no text layer) looked identical to a successful upload.
+  useDataChannel('resume-status', (message) => {
+    try {
+      const data = JSON.parse(new TextDecoder().decode(message.payload));
+      if (data.status === 'success') {
+        toast.success('Resume processed', {
+          description: "We'll tailor your interview questions to it.",
+        });
+      } else if (data.status === 'error') {
+        toast.error("Couldn't read your resume", {
+          description: 'Continuing with generic interview questions instead.',
+        });
+      }
+    } catch (error) {
+      console.error('Failed to parse resume-status message', error);
+    }
+  });
+
+  // Accumulates each answered question as it happens (see agent.py's _ask_and_record),
+  // independently of "interview-progress" (which only carries counts) and
+  // "interview-complete" (which only arrives at a normal finish).
+  useDataChannel('interview-transcript-entry', (message) => {
+    try {
+      const data = JSON.parse(new TextDecoder().decode(message.payload));
+      if (typeof data.question === 'string' && typeof data.answer === 'string') {
+        transcriptRef.current = [
+          ...transcriptRef.current,
+          { question: data.question, answer: data.answer, feedback: null },
+        ];
+      }
+    } catch (error) {
+      console.error('Failed to parse interview-transcript-entry message', error);
+    }
+  });
+
   useDataChannel('interview-complete', (message) => {
-    let transcript: TranscriptEntry[] = [];
+    let transcript: TranscriptEntry[] = transcriptRef.current;
     try {
       const data = JSON.parse(new TextDecoder().decode(message.payload));
       if (Array.isArray(data.transcript)) {
@@ -131,6 +177,7 @@ export function ViewController({ appConfig }: ViewControllerProps) {
   const handleStartCall = async (setup: InterviewSetup) => {
     pendingSetupRef.current = setup;
     setupSentRef.current = false;
+    transcriptRef.current = [];
     setPhase('preparing');
     try {
       await start();
@@ -147,6 +194,7 @@ export function ViewController({ appConfig }: ViewControllerProps) {
   const handleRestart = () => {
     pendingSetupRef.current = null;
     setupSentRef.current = false;
+    transcriptRef.current = [];
     setProgress({ questionsAsked: 0, maxQuestions: DEFAULT_MAX_QUESTIONS });
     sessionStartRef.current = null;
     setSummary(null);
